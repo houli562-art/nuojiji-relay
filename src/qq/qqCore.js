@@ -1,6 +1,4 @@
-// QQ 橋接（QQ 開放平台官方機器人，單聊 + 群聊 @）。
-// 群聊補丁 v1（2026-11-26）：在原單聊基礎上加群聊，只回 @ 機器人的群消息，
-//   用同一個 Worker / 同一個回調網址（https://chenshen.site/qq/hook/...），不用另起一套。
+// QQ 橋接（QQ 開放平台官方機器人，單聊）。
 // 流程和 iMessage 一樣是「平台把訊息推到中繼網址 → 攢一會兒 → 回覆」，所以沿用 ImessageBridgeCore 的
 // 排隊 / 連發合併 / 收媒體 / 公開檔案，只換掉 QQ 特有的：
 //   - 設定：AppID + AppSecret（中繼換 access_token 驗證），回調網址讓用戶貼到 QQ 開放平台
@@ -12,17 +10,13 @@
 //   acc       { appId, appSecret, hookToken, publicBase, userOpenid, bindCode, createdAt, verifiedAt }
 //   qqToken   { token, expiresAt }
 //   qqReply   { msgId, at, used }   最近一條用戶訊息（被動回覆用）
-//   群聊新增：
-//   qqGroup       { groupOpenid, msgId, at, used }  最近一個群 @ 的上下文（發群消息用）
-//   qqGroupReply  同上，發送時讀這個（和 qqReply 分開，私聊群聊互不搶次數）
-//   pendingGroup / pendingGroupSince  群消息排隊（和單聊 pending 分開，免得群消息回進私聊）
 
 import { ImessageBridgeCore } from '../imessage/imessageCore.js';
-import { now, replyWaitMs, replyWaitCapMs } from '../chatbridge/baseCore.js';
+import { now } from '../chatbridge/baseCore.js';
 import { bytesToB64 } from '../wechat/ilinkClient.js';
 import {
-    fetchAccessToken, qqCall, qqVerify, qqValidationReply, parseC2c, parseGroupAt, isPassiveExpired,
-    FileType, PASSIVE_WINDOW_MS, PASSIVE_MAX, GROUP_PASSIVE_WINDOW_MS, GROUP_PASSIVE_MAX,
+    fetchAccessToken, qqCall, qqVerify, qqValidationReply, parseC2c, isPassiveExpired,
+    FileType, PASSIVE_WINDOW_MS, PASSIVE_MAX,
 } from './qqApi.js';
 
 const randomToken = () => Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -48,14 +42,11 @@ export class QqBridgeCore extends ImessageBridgeCore {
     }
 
     async channelStatus() {
-        const [acc, inboxId, lastUserAt, qqGroup] = await Promise.all([this.s.get('acc'), this.s.get('inbox'), this.s.get('lastUserAt'), this.s.get('qqGroup')]);
+        const [acc, inboxId, lastUserAt] = await Promise.all([this.s.get('acc'), this.s.get('inbox'), this.s.get('lastUserAt')]);
         return {
             bound: !!acc,
             appId: acc?.appId || '',
             linked: !!acc?.userOpenid,
-            groupEnabled: true,
-            lastGroupOpenid: qqGroup?.groupOpenid || '',
-            lastGroupAt: qqGroup?.at || 0,
             // 還沒認到用戶本人 → 顯示綁定碼，讓用戶在 QQ 裡發給機器人
             bindCode: acc && !acc.userOpenid ? acc.bindCode : '',
             webhookUrl: acc && inboxId ? this._webhookUrl(acc, inboxId) : '',
@@ -100,12 +91,11 @@ export class QqBridgeCore extends ImessageBridgeCore {
         acc.bindCode = randomCode();
         await this.s.put('acc', acc);
         await this.s.delete('qqReply');
-        await this.s.delete('qqGroupReply');
         return { json: { ok: true, bindCode: acc.bindCode } };
     }
 
     async unbind() {
-        await Promise.all(['acc', 'qqToken', 'qqReply', 'qqGroup', 'qqGroupReply', 'pending', 'pendingSince', 'pendingGroup', 'pendingGroupSince', 'seen'].map((k) => this.s.delete(k)));
+        await Promise.all(['acc', 'qqToken', 'qqReply', 'pending', 'pendingSince', 'seen'].map((k) => this.s.delete(k)));
         await this.hooks.schedule(null);
         return { json: { ok: true } };
     }
@@ -218,128 +208,6 @@ export class QqBridgeCore extends ImessageBridgeCore {
         };
     }
 
-
-    // ---------- 群聊發送通道 ----------
-    // 和單聊 _chanFor 一樣，只是路徑換成 /v2/groups/{group_openid}，被動窗口約 5 分鐘。
-    // 語音在群裡只認 SILK，mp3 大概率失敗 → 直接退成文字，免得整輪卡住。
-    _chanForGroup(acc, groupCtx) {
-        const self = this;
-        const groupOpenid = groupCtx?.groupOpenid || '';
-        const path = `/v2/groups/${encodeURIComponent(groupOpenid)}`;
-        async function send(body) {
-            const token = await self._token(acc);
-            const ctx = await self.s.get('qqGroupReply');
-            if (ctx?.groupOpenid === groupOpenid && ctx?.msgId && now() - ctx.at < GROUP_PASSIVE_WINDOW_MS && (ctx.used || 0) < GROUP_PASSIVE_MAX) {
-                const seq = (ctx.used || 0) + 1;
-                try {
-                    const r = await qqCall(token, 'POST', `${path}/messages`, { ...body, msg_id: ctx.msgId, msg_seq: seq });
-                    await self.s.put('qqGroupReply', { ...ctx, used: seq });
-                    return r;
-                } catch (e) {
-                    if (!isPassiveExpired(e)) throw e;
-                    await self.s.put('qqGroupReply', { ...ctx, used: GROUP_PASSIVE_MAX });
-                }
-            }
-            return qqCall(token, 'POST', `${path}/messages`, { ...body, msg_seq: Math.floor(Math.random() * 1e6) + 1 });
-        }
-        async function upload(fileType, extra) {
-            const token = await self._token(acc);
-            const up = await qqCall(token, 'POST', `${path}/files`, { file_type: fileType, srv_send_msg: false, ...extra });
-            if (!up?.file_info) throw new Error('QQ upload: no file_info');
-            return up.file_info;
-        }
-        async function sendMedia(fileType, url, bytes) {
-            let fileInfo = null;
-            let firstErr = null;
-            if (bytes?.length) {
-                try { fileInfo = await upload(fileType, { file_data: bytesToB64(bytes) }); } catch (e) { firstErr = e; }
-            }
-            if (!fileInfo) {
-                try { fileInfo = await upload(fileType, { url }); } catch (e) { throw firstErr || e; }
-            }
-            return send({ msg_type: 7, media: { file_info: fileInfo } });
-        }
-        async function bytesOf(ref) {
-            const local = await self.loadSticker(ref);
-            if (local) return local.bytes;
-            if (!/^https?:\/\//i.test(String(ref || ''))) return null;
-            try {
-                const res = await fetch(ref);
-                if (!res.ok) return null;
-                const b = new Uint8Array(await res.arrayBuffer());
-                return b.length && b.length <= 20 * 1024 * 1024 ? b : null;
-            } catch { return null; }
-        }
-        return {
-            budget: Infinity,
-            // 生成期間群裡又 @ 了 → 交給核心併進這輪重新生成
-            async takeNew() {
-                const raw = (await self.s.get('pendingGroup')) || [];
-                if (!raw.length) return [];
-                await self.s.delete('pendingGroup');
-                await self.s.delete('pendingGroupSince');
-                return self._toPending(raw, this);
-            },
-            sendText: (text) => send({ msg_type: 0, content: text }),
-            sendSticker: async (url) => sendMedia(FileType.IMAGE, await self._mediaUrl(acc, url), await bytesOf(url)),
-            sendVideo: async (url) => sendMedia(FileType.VIDEO, await self._mediaUrl(acc, url), await bytesOf(url)),
-            async sendVoice(mp3, label, text) {
-                // 群語音只認 SILK，mp3 直接發文字，別讓整輪失敗
-                await send({ msg_type: 0, content: `[语音] ${String(text || label || '').trim()}`.trim() });
-            },
-            async typing(on) { /* 群聊沒有輸入中提示，空著 */ },
-        };
-    }
-
-    // 群消息排隊（和單聊 _enqueue 一樣，只是 key 換成 pendingGroup，發言人名字拼進文字裡）
-    async _enqueueGroup(msgs) {
-        const seen = (await this.s.get('seen')) || [];
-        const pending = (await this.s.get('pendingGroup')) || [];
-        let added = 0;
-        for (const m of msgs) {
-            if (m.id && seen.includes(String(m.id))) continue;
-            if (m.id) seen.push(String(m.id));
-            const name = String(m.senderName || '').trim();
-            pending.push({ text: name && m.text ? `[${name}] ${m.text}` : (m.text || ''), voiceText: m.voiceText || '', mediaUrls: m.mediaUrls || [], ts: m.ts || now() });
-            added++;
-        }
-        if (!added) return 0;
-        await this.s.put('seen', seen.slice(-300));
-        await this.s.put('pendingGroup', pending);
-        await this.s.put('lastUserAt', now());
-        const waitMs = replyWaitMs(await this.s.get('cfg'), 5000);
-        let since = await this.s.get('pendingGroupSince');
-        if (pending.length === added || !since) { since = now(); await this.s.put('pendingGroupSince', since); }
-        await this.hooks.schedule(Math.max(500, Math.min(waitMs, since + replyWaitCapMs(waitMs) - now())));
-        return added;
-    }
-
-    // 排程器：先走父類的單聊，再走群聊。群聊用群通道回，絕不回進私聊。
-    async runOnce() {
-        const c2c = await super.runOnce();
-        const acc = await this.s.get('acc');
-        const raw = (await this.s.get('pendingGroup')) || [];
-        if (!acc || !raw.length) return c2c;
-        const groupCtx = (await this.s.get('qqGroup')) || null;
-        if (!groupCtx?.groupOpenid) {
-            await this.s.delete('pendingGroup');
-            await this.s.delete('pendingGroupSince');
-            return c2c;
-        }
-        await this.s.delete('pendingGroup');
-        await this.s.delete('pendingGroupSince');
-        const chan = this._chanForGroup(acc, groupCtx);
-        const pending = await this._toPending(raw, chan);
-        try {
-            if (pending.length) await this.replyRound(chan, pending);
-            this.lastError = null;
-        } catch (e) {
-            this.lastError = String(e?.message || e);
-            console.warn('[qq-group] reply failed:', this.lastError);
-        }
-        return c2c;
-    }
-
     async openChannel() {
         const acc = await this.s.get('acc');
         if (!acc) return { reason: 'not set up' };
@@ -360,18 +228,6 @@ export class QqBridgeCore extends ImessageBridgeCore {
         }
         if (!(await qqVerify(acc.appSecret, headers, raw))) return { status: 401, json: { error: 'bad signature' } };
         const ack = { json: { op: 12 } };
-        // 群聊：只回 @ 機器人的消息。沒綁定私聊前先不回群（不知道回哪個角色）。
-        if (body?.op === 0 && (body?.t === 'GROUP_AT_MESSAGE_CREATE' || body?.t === 'GROUP_MESSAGE_CREATE')) {
-            if (body.t !== 'GROUP_AT_MESSAGE_CREATE') return ack; // v1 只回 @，普通群消息不回，免得刷屏
-            if (!acc.userOpenid) return ack;
-            const g = parseGroupAt(body.d);
-            if (!g.groupOpenid || !g.text) return ack;
-            const ctx = { groupOpenid: g.groupOpenid, msgId: g.id, at: now(), used: 0 };
-            await this.s.put('qqGroup', ctx);
-            await this.s.put('qqGroupReply', ctx);
-            await this._enqueueGroup([g]);
-            return ack;
-        }
         if (body?.op !== 0 || body?.t !== 'C2C_MESSAGE_CREATE') return ack;
         const m = parseC2c(body.d);
         if (!m.openid) return ack;

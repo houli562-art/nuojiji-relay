@@ -65,8 +65,7 @@ export function splitTranslation(obj, text) {
     return { orig: text, tr: '' };
 }
 // 發出去的樣子：原文，空一行，翻譯（和 App 氣泡下方的翻譯一樣）
-// 翻譯和原文一樣（中文回中文）就只發一遍，不然 QQ / 微信裡每句話都會出現兩次。
-export const withTranslation = (orig, tr) => (tr && String(tr).trim() !== String(orig).trim() ? `${orig}\n\n${tr}` : orig);
+export const withTranslation = (orig, tr) => (tr ? `${orig}\n\n${tr}` : orig);
 
 /**
  * @param {string} content AI 原始回覆

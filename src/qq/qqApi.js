@@ -1,5 +1,4 @@
-// QQ 官方機器人（QQ 開放平台 API v2）：單聊（C2C）+ 群聊 @（GROUP_AT_MESSAGE_CREATE）。
-// 群聊補丁 v1（2026-11-26）：只回 @ 機器人的群消息，發到群裡。
+// QQ 官方機器人（QQ 開放平台 API v2）：單聊（C2C）收發。
 //
 // 文件：https://bot.q.qq.com/wiki/develop/api-v2/
 //   - access_token：POST https://api.bot.qq.com/app/getAppAccessToken { appId, clientSecret } → { access_token, expires_in }
@@ -9,9 +8,6 @@
 //       回調地址驗證（op 13）：簽 event_ts + plain_token，回 { plain_token, signature }
 //   - 單聊回覆：POST /v2/users/{openid}/messages；帶 msg_id = 被動回覆（每條用戶訊息有限次數 / 時效），
 //     不帶 = 主動消息（個人 Bot 每用戶每日上限 1000；用戶可在 QQ 裡關「允許主動發送」）
-//   - 群聊回覆：POST /v2/groups/{group_openid}/messages；帶 msg_id = 被動回覆（約 5 分鐘內、每條最多 4 次），
-//     不帶 = 主動消息。群事件：GROUP_AT_MESSAGE_CREATE（@ 機器人），d.group_openid 是群，
-//     d.author.member_openid 是群內發言人的專屬 id，@ 已被平台剝離。
 //   - 富媒體：先 POST /v2/users/{openid}/files { file_type, url } 拿 file_info，再發 msg_type 7
 
 export const QQ_API = 'https://api.sgroup.qq.com';
@@ -20,9 +16,6 @@ export const QQ_TOKEN_URL = 'https://api.bot.qq.com/app/getAppAccessToken';
 // 被動回覆：文件寫「單聊 60 分鐘內、每條最多回 4 次」（另一處寫 msg_id 5 分鐘有效 → 失敗就改主動發）
 export const PASSIVE_WINDOW_MS = 60 * 60 * 1000;
 export const PASSIVE_MAX = 4;
-// 群聊被動回覆窗口：官方寫約 5 分鐘，超了就改主動發
- export const GROUP_PASSIVE_WINDOW_MS = 5 * 60 * 1000;
-export const GROUP_PASSIVE_MAX = 4;
 // 過期 / 超次數的錯誤碼 → 改用主動消息重發
 const PASSIVE_EXPIRED_CODES = new Set([40034128, 304103, 40034024, 22009]);
 
@@ -151,25 +144,5 @@ export function parseC2c(d) {
         voiceText,
         mediaUrls,
         ts,
-    };
-}
-
-/** 群聊 @ 事件 → { id, groupOpenid, memberOpenid, senderName, text, voiceText, mediaUrls, ts } */
-export function parseGroupAt(d) {
-    const base = parseC2c(d);
-    const author = d?.author || {};
-    // @ 已被平台剝離，但殘留的 <qqbot-at-... /> / @xxx 標記再清一次
-    let text = String(base.text || '')
-        .replace(/<qqbot-at-[^>]*>/gi, '')
-        .replace(/<@!?(?:\d+)>/g, '')
-        .replace(/^@[^\s]+\s*/, '')
-        .trim();
-    const senderName = String(author.username || author.nickname || author.member_nickname || author.member_openid || '群友').trim();
-    return {
-        ...base,
-        groupOpenid: String(d?.group_openid || ''),
-        memberOpenid: String(author.member_openid || author.user_openid || ''),
-        senderName,
-        text,
     };
 }
